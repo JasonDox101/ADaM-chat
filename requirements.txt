@@ -22,7 +22,7 @@ openai>=1.0.0
 dashscope>=1.14.0
 
 # Document Processing
-PyPDF2>=3.0.0
+pypdf>=3.0.0
 markdown>=3.5.0
 
 # Environment & Configuration
