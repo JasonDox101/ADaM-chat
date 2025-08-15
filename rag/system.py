@@ -105,113 +105,121 @@ class ADaMRAGSystem:  # 重命名类
             pass
     
     def _build_workflow(self) -> None:
-        """Build enhanced LangGraph workflow."""
-        workflow = StateGraph(ADaMRAGState)  # Updated to ADaMRAGState
+        """构建优化的LangGraph工作流程 - 减少LLM调用次数"""
+        workflow = StateGraph(ADaMRAGState)
         
-        # Add nodes
-        workflow.add_node("analyze_context", self._analyze_context)
-        workflow.add_node("classify_question", self._classify_question)
+        # 添加优化后的节点
+        workflow.add_node("analyze_context_and_classify", self._analyze_context_and_classify)  # 合并节点1
         workflow.add_node("retrieve_documents", self._retrieve_documents)
-        workflow.add_node("generate_answer", self._generate_answer)
-        workflow.add_node("summarize_answer", self._summarize_answer)
+        workflow.add_node("generate_answer_with_summary", self._generate_answer_with_summary)  # 合并节点2
         workflow.add_node("validate_answer", self._validate_answer)
         
-        # Set edges - new workflow
-        workflow.set_entry_point("analyze_context")
-        workflow.add_edge("analyze_context", "classify_question")
-        workflow.add_edge("classify_question", "retrieve_documents")
-        workflow.add_edge("retrieve_documents", "generate_answer")
-        workflow.add_edge("generate_answer", "summarize_answer")
-        workflow.add_edge("summarize_answer", "validate_answer")
+        # 设置优化后的边 - 新工作流程
+        workflow.set_entry_point("analyze_context_and_classify")
+        workflow.add_edge("analyze_context_and_classify", "retrieve_documents")
+        workflow.add_edge("retrieve_documents", "generate_answer_with_summary")
+        workflow.add_edge("generate_answer_with_summary", "validate_answer")
         workflow.add_edge("validate_answer", END)
         
         self.workflow = workflow.compile()
     
-    def _analyze_context(self, state: ADaMRAGState) -> Dict[str, Any]:  # Updated parameter type
-        """Analyze conversation context node."""
+    def _analyze_context_and_classify(self, state: ADaMRAGState) -> Dict[str, Any]:
+        """合并的上下文分析和问题分类节点 - 优化为一次LLM调用"""
         try:
             question = state["question"]
             history = state.get("conversation_history", [])
             processing_steps = state.get("processing_steps", [])
-            processing_steps.append("Starting context analysis")
+            processing_steps.append("Starting combined context analysis and question classification")
             
-            if not history:
-                return {
-                    "context_summary": "No historical conversation context",
-                    "related_previous_qa": [],
-                    "is_context_related": False,
-                    "processing_steps": processing_steps
-                }
-            
-            # Enhanced context analysis prompt
-            context_prompt = f"""
-You are an ADaM clinical data analysis expert. Please carefully analyze the relationship between the current question and historical conversations.
+            # 构建合并的提示词
+            combined_prompt = f"""
+你是一位专业的ADaM（Analysis Data Model）临床数据分析专家。请同时完成以下两个任务：
 
-Current question: {question}
+**任务1：上下文分析**
+当前问题：{question}
 
-Historical conversations:
-{self._format_history_for_analysis(history)}
+历史对话：
+{self._format_history_for_analysis(history) if history else "无历史对话"}
 
-Analysis requirements:
-1. Check if the current question references concepts, values, variable names mentioned previously
-2. Determine if previous answers are needed to answer the current question
-3. Identify relevant historical Q&A pairs
-4. Generate a concise context summary
+请分析当前问题与历史对话的关系。
 
-Please return in JSON format (ensure correct format):
+**任务2：问题分类**
+请将问题分类到以下类别之一：
+- "adsl": ADSL主题级分析数据集相关问题
+- "bds": BDS基础数据结构相关问题  
+- "occds": OCCDS事件数据结构相关问题
+- "variable": 变量相关问题（PARAMCD, AVAL, BASE等）
+- "methodology": 方法论相关问题（编程、验证、溯源性等）
+- "general": ADaM标准与概念相关的一般性问题
+
+请以JSON格式返回结果：
 {{
-    "is_related": true,
-    "context_summary": "Concise context summary",
-    "related_qa_indices": [0, 1],
-    "reasoning": "Detailed reasoning for relationship analysis"
+    "context_analysis": {{
+        "is_related": true/false,
+        "context_summary": "上下文摘要",
+        "related_qa_indices": [0, 1],
+        "reasoning": "关系分析推理"
+    }},
+    "question_type": "分类结果"
 }}
 """
             
             messages = [
-                {"role": "system", "content": "You are a professional clinical data analysis assistant, skilled at analyzing conversation context relationships. Please return results strictly in JSON format."},
-                {"role": "user", "content": context_prompt}
+                {"role": "system", "content": "你是专业的临床数据分析助手，擅长分析对话上下文关系和问题分类。请严格按照JSON格式返回结果。"},
+                {"role": "user", "content": combined_prompt}
             ]
             
             try:
-                analysis_result = self.llm_client.generate_response(messages)
+                result = self.llm_client.generate_response(messages)
                 
-                # Clean possible markdown format
-                if "```json" in analysis_result:
-                    analysis_result = analysis_result.split("```json")[1].split("```")[0].strip()
-                elif "```" in analysis_result:
-                    analysis_result = analysis_result.split("```")[1].strip()
+                # 清理可能的markdown格式
+                if "```json" in result:
+                    result = result.split("```json")[1].split("```")[0].strip()
+                elif "```" in result:
+                    result = result.split("```")[1].strip()
                 
-                analysis = json.loads(analysis_result)
+                combined_result = json.loads(result)
+                context_analysis = combined_result.get("context_analysis", {})
+                question_type = combined_result.get("question_type", "general")
+                
             except Exception as e:
-                # If LLM analysis fails, use enhanced keyword matching
-                analysis = self._enhanced_context_analysis(question, history)
+                # 如果LLM分析失败，使用增强的关键词匹配
+                context_analysis = self._enhanced_context_analysis(question, history)
+                question_type = "general"
             
-            # Extract relevant historical Q&A
+            # 提取相关的历史问答
             related_qa = []
-            if analysis.get("is_related", False):
-                for idx in analysis.get("related_qa_indices", []):
+            if context_analysis.get("is_related", False):
+                for idx in context_analysis.get("related_qa_indices", []):
                     if 0 <= idx < len(history):
                         related_qa.append({
                             "question": history[idx]["question"],
                             "answer": history[idx]["answer"]
                         })
             
-            processing_steps.append("Context analysis completed")
+            # 确保分类结果有效
+            valid_types = ["adsl", "bds", "occds", "variable", "methodology", "general"]
+            if question_type not in valid_types:
+                question_type = "general"
+            
+            processing_steps.append(f"Combined analysis completed - Type: {question_type}, Context related: {context_analysis.get('is_related', False)}")
             
             return {
-                "context_summary": analysis.get("context_summary", ""),
+                "context_summary": context_analysis.get("context_summary", ""),
                 "related_previous_qa": related_qa,
-                "is_context_related": analysis.get("is_related", False),
+                "is_context_related": context_analysis.get("is_related", False),
+                "question_type": question_type,
                 "processing_steps": processing_steps
             }
             
         except Exception as e:
             return {
-                "context_summary": "Context analysis failed",
+                "context_summary": "Combined analysis failed",
                 "related_previous_qa": [],
                 "is_context_related": False,
-                "error": f"Context analysis failed: {str(e)}",
-                "processing_steps": processing_steps + [f"Context analysis failed: {str(e)}"]
+                "question_type": "general",
+                "error": f"Combined analysis failed: {str(e)}",
+                "processing_steps": processing_steps + [f"Combined analysis failed: {str(e)}"]
             }
     
     def _enhanced_context_analysis(self, question: str, history: List[Dict]) -> Dict[str, Any]:
@@ -365,72 +373,63 @@ Please return in JSON format (ensure correct format):
             # If generation fails, return original question
             return question
     
-    def _generate_answer(self, state: ADaMRAGState) -> Dict[str, Any]:  # Updated parameter type
-        """Generate answer node with language control."""
+    def _generate_answer_with_summary(self, state: ADaMRAGState) -> Dict[str, Any]:
+        """合并的答案生成和摘要节点 - 优化为一次LLM调用"""
         try:
             question = state["question"]
             retrieved_docs = state.get("retrieved_documents", [])
             related_qa = state.get("related_previous_qa", [])
             context_summary = state.get("context_summary", "")
-            output_language = state.get("output_language", "english")  # 获取语言参数
+            output_language = state.get("output_language", "english")
             processing_steps = state.get("processing_steps", [])
-            processing_steps.append("Starting context-aware answer generation")
+            processing_steps.append("Starting combined answer generation and summarization")
             
-            # Build document context
+            # 构建文档上下文
             context = self._build_context(retrieved_docs)
             
-            # Build prompt with historical context
+            # 构建上下文信息
             context_info = ""
             if related_qa:
-                context_info = "\n\n**Related Historical Conversations:**\n"
+                context_info = "\n\n**相关历史对话：**\n"
                 for i, qa in enumerate(related_qa, 1):
-                    context_info += f"{i}. Q: {qa['question']}\n   A: {qa['answer']}\n\n"
+                    context_info += f"{i}. Q: {qa['question']}\n   A: {qa['answer'][:200]}...\n\n"
             
-            if context_summary and context_summary != "No historical conversation context":
-                context_info += f"\n**Conversation Context Summary:**\n{context_summary}\n\n"
-            
-            # 根据语言选择设置语言指令
+            # 根据语言设置不同的指令
             if output_language == "chinese":
                 language_instruction = "请用中文回答。确保所有回答内容都使用中文，包括临床术语的中文表达。"
-                # 在_generate_answer方法中的system_content部分扩展
-                if output_language == "chinese":
-                    system_content = """你是一位专业的ADaM（Analysis Data Model）临床数据分析专家助手，具备以下专业能力：
-
-**核心专业领域：**
-- ADaM标准数据模型设计与实施
-- CDISC标准合规性评估与指导
-- 临床试验统计分析数据集构建
-- 监管提交数据包准备与审查
-- SAS编程与数据验证
-- 临床数据质量控制与保证
-
-**专业知识覆盖：**
-- ADSL（Subject-Level Analysis Dataset）设计原则
-- BDS（Basic Data Structure）数据集架构
-- OCCDS（Occurrence Data Structure）事件数据处理
-- ADTTE（Time-to-Event Analysis Dataset）生存分析
-- 安全性数据集（ADAE, ADCM, ADMH等）构建
-- 疗效数据集（ADEFF, ADRS等）分析
-- 实验室数据集（ADLB, ADVS等）标准化
-- PK/PD数据集（ADPC, ADPP）药代动力学分析
-
-**技术能力：**
-- 变量命名规范与元数据管理
-- 数据溯源性（Traceability）建立
-- 数据验证规则设计
-- 统计分析计划（SAP）对接
-- 监管指南解读（FDA, EMA, PMDA等）
-
-请严格遵循markdown格式要求，结合历史对话上下文提供准确、专业的中文回答。"""
-            else:
-                language_instruction = "Please respond in English. Ensure all content is in English, including clinical terminology."
-                system_content = "You are a professional ADaM clinical data analysis assistant who can provide accurate answers by combining historical conversation context. Please strictly follow markdown format requirements while maintaining a professional answering style. Please respond in English."
-            
-            # Modified prompt to include language control
-            enhanced_prompt = f"""
+                system_content = """你是一位专业的ADaM（Analysis Data Model）临床数据分析专家助手。请同时提供详细回答和结构化摘要。"""
+                
+                combined_prompt = f"""
 {language_instruction}
 
-You are a professional ADaM clinical data analysis assistant. Please answer the user's question based on the provided document context and conversation history.
+请基于提供的文档上下文和对话历史回答用户问题，并同时提供详细回答和结构化摘要。
+
+用户当前问题：{question}
+
+文档上下文：
+{context}
+{context_info}
+
+请以JSON格式返回结果，包含以下两部分：
+{{
+    "detailed_answer": "详细的专业回答（严格遵循markdown格式）",
+    "summary_answer": "结构化摘要（200-400字，包含核心概念、关键技术要点、实用指导、ADaM标准关联、业务价值）"
+}}
+
+**格式要求：**
+1. **详细回答**：使用## 主标题，### 副标题，- 无序列表，**粗体**强调重要信息
+2. **摘要**：简洁但信息丰富，突出关键技术细节和实用指导
+3. 使用专业的ADaM/CDISC术语
+4. 如果与之前问题相关，请在回答中体现这种关系
+"""
+            else:
+                language_instruction = "Please respond in English. Ensure all content is in English, including clinical terminology."
+                system_content = "You are a professional ADaM clinical data analysis assistant. Please provide both detailed answer and structured summary simultaneously."
+                
+                combined_prompt = f"""
+{language_instruction}
+
+Please answer the user's question based on the provided document context and conversation history, and provide both detailed answer and structured summary.
 
 User's current question: {question}
 
@@ -438,55 +437,69 @@ Document context:
 {context}
 {context_info}
 
-**Important: Please strictly follow the markdown format requirements below, while maintaining your professional answering style and content depth:**
+Please return results in JSON format with the following two parts:
+{{
+    "detailed_answer": "Detailed professional answer (strictly follow markdown format)",
+    "summary_answer": "Structured summary (200-400 words, including core concepts, key technical points, practical guidance, ADaM standard connections, business value)"
+}}
 
-1. **Title format**: Use ## for main titles, ### for subtitles
-2. **List format**: Use - for unordered lists, or 1. for ordered lists
-3. **Emphasis format**: Mark important information with **bold**
-4. **Numerical format**: Highlight specific values and units with **bold**
-5. **Paragraph format**: Separate paragraphs with blank lines
-
-Please maintain your consistent:
-- Accurate, professional clinical terminology usage
-- Accurate, professional answers
-- If related to previous questions, please reflect this relationship in the answer
-- Detailed data analysis and interpretation
-- Objective academic tone
-- Rich background information provision
-- Include specific data and indicators
-
-Note: If the current question is related to previous questions, please reflect this relationship in your answer.
-
-Ensure standardized output format.
+**Format requirements:**
+1. **Detailed answer**: Use ## main titles, ### subtitles, - unordered lists, **bold** for emphasis
+2. **Summary**: Concise but information-rich, highlighting key technical details and practical guidance
+3. Use professional ADaM/CDISC terminology
+4. If related to previous questions, reflect this relationship in the answer
 """
             
             messages = [
                 {"role": "system", "content": system_content},
-                {"role": "user", "content": enhanced_prompt}
+                {"role": "user", "content": combined_prompt}
             ]
             
-            answer = self.llm_client.generate_response(messages)
+            try:
+                result = self.llm_client.generate_response(messages)
+                
+                # 清理可能的markdown格式
+                if "```json" in result:
+                    result = result.split("```json")[1].split("```")[0].strip()
+                elif "```" in result:
+                    result = result.split("```")[1].strip()
+                
+                combined_result = json.loads(result)
+                detailed_answer = combined_result.get("detailed_answer", "")
+                summary_answer = combined_result.get("summary_answer", "")
+                
+            except Exception as e:
+                # 如果解析失败，尝试直接使用结果作为详细回答
+                detailed_answer = result if 'result' in locals() else "Answer generation failed"
+                summary_answer = "Summary generation failed"
             
-            # Apply markdown format standardization
-            answer = self._ensure_markdown_format(answer)
+            # 应用markdown格式标准化
+            detailed_answer = self._ensure_markdown_format(detailed_answer)
             
-            # Extract source information
+            # 提取源信息
             sources = self._extract_sources(retrieved_docs)
             
-            processing_steps.append("Context-aware answer generation completed")
+            # 确保摘要不为空
+            if not summary_answer or summary_answer.strip() == "":
+                summary_answer = "Combined generation completed but summary is empty"
+            
+            processing_steps.append("Combined answer generation and summarization completed")
             
             return {
                 "context": context,
-                "answer": answer,
+                "answer": detailed_answer,
+                "summary_answer": summary_answer,
                 "sources": sources,
                 "processing_steps": processing_steps
             }
             
         except Exception as e:
             return {
-                "error": f"Answer generation failed: {str(e)}",
+                "error": f"Combined generation failed: {str(e)}",
                 "answer": "Sorry, an error occurred while generating the answer.",
-                "processing_steps": processing_steps + [f"Answer generation failed: {str(e)}"]
+                "summary_answer": "Summary generation failed",
+                "sources": [],
+                "processing_steps": processing_steps + [f"Combined generation failed: {str(e)}"]
             }
     
     def _build_context(self, documents: List) -> str:
